@@ -5,138 +5,99 @@ on:
 
 jobs:
   secure-rdp:
-    # CentOS 7 self-hosted runner: runner’ına bu etiketleri ver (ör: self-hosted, linux, x64, centos7)
     runs-on: [self-hosted, linux, x64, centos7]
     timeout-minutes: 3600
 
     env:
       RDP_USER: RDP
-      # İstersen Settings > Secrets > Actions altına RDP_PASSWORD olarak koy.
-      # Yoksa otomatik güçlü parola üretilecek.
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
-      - name: Prepare and Update (yum/epel)
+      - name: Update + EPEL
         run: |
           sudo yum clean all
           sudo yum -y update || true
-          # XRDP için EPEL gerekli
           sudo yum -y install epel-release
 
-      - name: Install XRDP and deps
+      - name: Install XRDP + Desktop (Xfce)
         run: |
           sudo yum -y install xrdp xorgxrdp
-          # Varsayılan desktop yoksa minimal kullanım için bir X bileşeni gerekebilir
+          # Minimal Xfce (bazı repolarda grup adı fark edebilir)
           sudo yum -y groupinstall "Xfce" || true
+          # Alternatif paketler
+          sudo yum -y install xfce4-session xfce4-panel xfce4-terminal thunar || true
 
-      - name: Configure SELinux (permissive for XRDP)
-        run: |
-          # Anlık permissive
-          if command -v getenforce >/dev/null 2>&1; then
-            if [ "$(getenforce)" != "Disabled" ]; then
-              sudo setenforce 0 || true
-              # Kalıcı olarak permissive
-              sudo sed -ri 's/^SELINUX=enforcing/SELINUX=permissive/i' /etc/selinux/config || true
-            fi
-          fi
-
-      - name: Configure XRDP (disable NLA-like, allow connections)
-        run: |
-          sudo sed -ri 's/^#?security_layer=.*/security_layer=rdp/i' /etc/xrdp/xrdp.ini || true
-          sudo sed -ri 's/^#?crypt_level=.*/crypt_level=high/i' /etc/xrdp/xrdp.ini || true
-          # 3389 port’u zaten default; garantiye alalım
-          sudo sed -ri 's/^#?port=.*/port=3389/i' /etc/xrdp/xrdp.ini || true
-
-      - name: Open Firewall (3389/tcp)
-        run: |
-          if systemctl is-active --quiet firewalld; then
-            sudo firewall-cmd --permanent --add-port=3389/tcp
-            sudo firewall-cmd --reload
-          else
-            # Firewalld yoksa iptables üzerinden açmayı dene
-            if command -v iptables >/dev/null 2>&1; then
-              sudo iptables -I INPUT -p tcp --dport 3389 -j ACCEPT
-              sudo service iptables save || true
-            fi
-          fi
-
-      - name: Enable and start xrdp
-        run: |
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
-          sudo systemctl status xrdp --no-pager || true
-
-      - name: Create RDP User (generate strong password if not provided)
-        id: user
+      - name: Create Desktop Session for user
         run: |
           set -e
           USERNAME="${RDP_USER}"
-
-          # Parola belirle
-          if [ -z "${RDP_PASSWORD}" ]; then
-            # 16+ random karakter
-            PASSWORD="$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 20)"
-          else
-            PASSWORD="${RDP_PASSWORD}"
+          PASS="${RDP_PASSWORD}"
+          if [ -z "$PASS" ]; then
+            PASS="$(tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' </dev/urandom | head -c 20)"
           fi
 
-          # Kullanıcı oluştur (varsa şifreyi güncelle)
-          if id "${USERNAME}" >/dev/null 2>&1; then
-            echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+          if id "$USERNAME" >/dev/null 2>&1; then
+            echo "$USERNAME:$PASS" | sudo chpasswd
           else
-            sudo useradd -m -s /bin/bash "${USERNAME}"
-            echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
+            sudo useradd -m -s /bin/bash "$USERNAME"
+            echo "$USERNAME:$PASS" | sudo chpasswd
           fi
 
-          # Sudo izni gerekirse (opsiyonel):
-          sudo usermod -aG wheel "${USERNAME}" || true
+          sudo -u "$USERNAME" bash -lc 'echo "startxfce4" > ~/.Xclients && chmod +x ~/.Xclients'
 
-          echo "RDP_USER=${USERNAME}" >> $GITHUB_ENV
-          echo "RDP_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+          echo "RDP_PASSWORD=$PASS" >> $GITHUB_ENV
 
-      - name: Install Tailscale
+      - name: SELinux permissive (first run)
+        run: |
+          if command -v getenforce >/dev/null 2>&1; then
+            sudo setenforce 0 || true
+            sudo sed -ri 's/^SELINUX=enforcing/SELINUX=permissive/i' /etc/selinux/config || true
+          fi
+
+      - name: Open 3389 in firewalld
+        run: |
+          if systemctl is-active --quiet firewalld; then
+            ZONE="$(firewall-cmd --get-default-zone || echo public)"
+            sudo firewall-cmd --zone="$ZONE" --permanent --add-port=3389/tcp
+            sudo firewall-cmd --reload
+          fi
+
+      - name: Enable + Start XRDP
+        run: |
+          sudo systemctl enable xrdp xrdp-sesman
+          sudo systemctl restart xrdp xrdp-sesman
+          systemctl status xrdp --no-pager || true
+          systemctl status xrdp-sesman --no-pager || true
+
+      - name: Install + Up Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable tailscaled
           sudo systemctl restart tailscaled
-          sudo systemctl status tailscaled --no-pager || true
-
-      - name: Tailscale Up
-        run: |
           if [ -z "${TAILSCALE_AUTH_KEY}" ]; then
-            echo "TAILSCALE_AUTH_KEY secret is missing"; exit 1
+            echo "TAILSCALE_AUTH_KEY missing"; exit 1
           fi
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="gh-centos7-${GITHUB_RUN_ID}" --accept-routes=true
-          # IPv4 Tailscale IP al
           TS_IP="$(tailscale ip -4 | head -n1)"
           if [ -z "$TS_IP" ]; then
-            echo "No Tailscale IP assigned"; exit 1
+            echo "No Tailscale IP"; exit 1
           fi
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Verify RDP Accessibility over Tailscale
+      - name: Print access + logs
         run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          # nc ile 3389 testi
-          if command -v nc >/dev/null 2>&1; then
-            nc -zv "$TAILSCALE_IP" 3389
-          else
-            # Busybox ncat yoksa alternatif test
-            timeout 3 bash -c "cat < /dev/null > /dev/tcp/$TAILSCALE_IP/3389" || true
-          fi
+          echo "=== XRDP ==="
+          echo "User: $RDP_USER"
+          echo "Pass: $RDP_PASSWORD"
+          echo "Tailscale: $TAILSCALE_IP:3389"
+          echo "------------ Logs (last 100) ------------"
+          tail -n 100 /var/log/xrdp.log || true
+          tail -n 100 /var/log/xrdp-sesman.log || true
 
-      - name: Show Access and Keep Alive
+      - name: Keep Alive
         run: |
-          echo
-          echo "=== RDP ACCESS (XRDP on CentOS 7) ==="
-          echo "Address (Tailscale): $TAILSCALE_IP:3389"
-          echo "Username: $RDP_USER"
-          echo "Password: $RDP_PASSWORD"
-          echo "====================================="
-          echo
-          # Runner’i canlı tut (workflow iptal edilene kadar)
           while true; do
-            echo "[$(date)] XRDP Active on $TAILSCALE_IP:3389 (Ctrl+C to stop in Actions UI)"
+            echo "[$(date)] XRDP alive at $TAILSCALE_IP:3389 (user: $RDP_USER)"
             sleep 300
           done
